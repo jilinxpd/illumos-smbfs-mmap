@@ -175,6 +175,10 @@ static int	smbfs_getsecattr(vnode_t *, vsecattr_t *, int, cred_t *,
 static int	smbfs_shrlock(vnode_t *, int, struct shrlock *, int, cred_t *,
 			caller_context_t *);
 
+static int uio_page_mapin(uio_t *uiop, page_t *pp);
+
+static void uio_page_mapout(uio_t *uiop, page_t *pp);
+
 static int smbfs_map(vnode_t *vp, offset_t off, struct as *as, caddr_t *addrp,
         size_t len, uchar_t prot, uchar_t maxprot, uint_t flags, cred_t *cr,
         caller_context_t *ct);
@@ -193,15 +197,13 @@ static int smbfs_putpage(vnode_t *vp, offset_t off, size_t len, int flags,
 static int smbfs_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp, size_t *lenp,
         int flags, cred_t *cr);
 
-static int up_mapin(uio_t *uiop, page_t *pp);
-
-static int up_mapout(uio_t *uiop, page_t *pp);
-
-static int smbfs_getpage(vnode_t *vp, offset_t off, size_t len, uint_t *protp, page_t *pl[], size_t plsz, struct seg *seg, caddr_t addr,
+static int smbfs_getpage(vnode_t *vp, offset_t off, size_t len, uint_t *protp,
+        page_t *pl[], size_t plsz, struct seg *seg, caddr_t addr,
         enum seg_rw rw, cred_t *cr, caller_context_t *ct);
 
 static int smbfs_getapage(vnode_t *vp, u_offset_t off, size_t len,
-        uint_t *protp, page_t *pl[], size_t plsz, struct seg *seg, caddr_t addr, enum seg_rw rw, cred_t *cr);
+        uint_t *protp, page_t *pl[], size_t plsz, struct seg *seg, caddr_t addr,
+        enum seg_rw rw, cred_t *cr);
 
 
 
@@ -3141,8 +3143,74 @@ smbfs_shrlock(vnode_t *vp, int cmd, struct shrlock *shr, int flag, cred_t *cr,
 		return (ENOSYS);
 }
 
+static int uio_page_mapin(uio_t *uiop, page_t *pp) {
+    u_offset_t off;
+    size_t size;
+    pgcnt_t npages;
+    caddr_t kaddr;
+    pfn_t pfnum;
 
+    off = (uintptr_t) uiop->uio_loffset & PAGEOFFSET;
+    size = P2ROUNDUP(uiop->uio_resid + off, PAGESIZE);
+    npages = btop(size);
 
+    ASSERT(pp != NULL);
+
+    if (npages == 1 && kpm_enable) {
+        kaddr = hat_kpm_mapin(pp, NULL);
+        if (kaddr == NULL)
+            return (EFAULT);
+
+        uiop->uio_iov->iov_base = kaddr + off;
+        uiop->uio_iov->iov_len = PAGESIZE - off;
+
+    } else {
+        kaddr = vmem_xalloc(heap_arena, size, PAGESIZE, 0, 0, NULL, NULL, VM_SLEEP);
+        if (kaddr == NULL)
+            return (EFAULT);
+
+        uiop->uio_iov->iov_base = kaddr + off;
+        uiop->uio_iov->iov_len = size - off;
+
+        /*map pages into kaddr*/
+        uint_t attr = PROT_READ | PROT_WRITE | HAT_NOSYNC;
+        while (npages-- > 0) {
+            pfnum = pp->p_pagenum;
+            pp = pp->p_next;
+
+            hat_devload(kas.a_hat, kaddr, PAGESIZE, pfnum, attr, HAT_LOAD_LOCK);
+            kaddr += PAGESIZE;
+        }
+    }
+    return (0);
+}
+
+static void uio_page_mapout(uio_t *uiop, page_t *pp) {
+    u_offset_t off;
+    size_t size;
+    pgcnt_t npages;
+    caddr_t kaddr;
+
+    kaddr = uiop->uio_iov->iov_base;
+    off = (uintptr_t) kaddr & PAGEOFFSET;
+    size = P2ROUNDUP(uiop->uio_iov->iov_len + off, PAGESIZE);
+    npages = btop(size);
+
+    ASSERT(pp != NULL);
+
+    kaddr = (caddr_t) ((uintptr_t) kaddr & MMU_PAGEMASK);
+
+    if (npages == 1 && kpm_enable) {
+        hat_kpm_mapout(pp, NULL, kaddr);
+
+    } else {
+        hat_unload(kas.a_hat, (void*) kaddr, size,
+                HAT_UNLOAD_NOSYNC | HAT_UNLOAD_UNLOCK);
+        vmem_free(heap_arena, (void*) kaddr, size);
+    }
+    uiop->uio_iov->iov_base = 0;
+    uiop->uio_iov->iov_len = 0;
+}
 
 static int smbfs_map(vnode_t *vp, offset_t off, struct as *as, caddr_t *addrp,
         size_t len, uchar_t prot, uchar_t maxprot, uint_t flags, cred_t *cr,
@@ -3150,6 +3218,7 @@ static int smbfs_map(vnode_t *vp, offset_t off, struct as *as, caddr_t *addrp,
     smbnode_t *np;
     smbmntinfo_t *smi;
     struct vattr va;
+    struct smb_cred scred;
     segvn_crargs_t vn_a;
     int error;
 
@@ -3169,7 +3238,6 @@ static int smbfs_map(vnode_t *vp, offset_t off, struct as *as, caddr_t *addrp,
         return (ENODEV);
 
     va.va_mask = AT_ALL;
-
     if (error = smbfsgetattr(vp, &va, cr))
         return (error);
 
@@ -3190,13 +3258,13 @@ static int smbfs_map(vnode_t *vp, offset_t off, struct as *as, caddr_t *addrp,
     }
 
     vn_a.vp = vp;
-    vn_a.offset = (u_offset_t) off;
+    vn_a.offset = off;
     vn_a.type = flags & MAP_TYPE;
-    vn_a.prot = (uchar_t) prot;
-    vn_a.maxprot = (uchar_t) maxprot;
+    vn_a.prot = prot;
+    vn_a.maxprot = maxprot;
+    vn_a.flags = flags & ~MAP_TYPE;
     vn_a.cred = cr;
     vn_a.amp = NULL;
-    vn_a.flags = flags & ~MAP_TYPE;
     vn_a.szc = 0;
     vn_a.lgrp_mem_policy_flags = 0;
 
@@ -3276,7 +3344,7 @@ static int smbfs_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp, size_t *len
     smbmntinfo_t *smi;
     smb_share_t *ssp;
     uio_t uio;
-    iovec_t uiov;
+    iovec_t uiov, uiov_bak;
 
     u_offset_t off;
     size_t len;
@@ -3319,8 +3387,10 @@ static int smbfs_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp, size_t *len
         uio.uio_resid = len;
         uio.uio_segflg = UIO_SYSSPACE;
         uio.uio_llimit = MAXOFFSET_T;
-        error = up_mapin(&uio, pp);
+        error = uio_page_mapin(&uio, pp);
         if (error == 0) {
+            uiov_bak.iov_base = uiov.iov_base;
+            uiov_bak.iov_len = uiov.iov_len;
             error = smb_rwuio(ssp, np->n_fid, UIO_WRITE, &uio, &scred, timo);
             if (error == 0) {
                 mutex_enter(&np->r_statelock);
@@ -3328,72 +3398,39 @@ static int smbfs_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp, size_t *len
                 mutex_exit(&np->r_statelock);
                 (void) smbfs_smb_flush(np, &scred);
             }
-            up_mapout(&uio, pp);
+            uio.uio_iov = &uiov_bak;
+            uio_page_mapout(&uio, pp);
         }
     }
     smb_credrele(&scred);
     smbfs_rw_exit(&np->r_lkserlock);
 
 out:
-    pvn_write_done(pp, B_WRITE | flags);
+    pvn_write_done(pp, ((error) ? B_ERROR : 0) | B_WRITE | flags);
 
     return (error);
-}
-
-static int up_mapin(uio_t *uiop, page_t *pp) {
-    u_offset_t off;
-    size_t size;
-    pgcnt_t npages;
-    caddr_t kaddr;
-
-    off = (uintptr_t) uiop->uio_loffset & PAGEOFFSET;
-    size = P2ROUNDUP(uiop->uio_resid + off, PAGESIZE);
-    npages = btop(size);
-
-    if (npages == 1 && kpm_enable) {
-        kaddr = hat_kpm_mapin(pp, NULL);
-        uiop->uio_iov->iov_base = kaddr;
-        uiop->uio_iov->iov_len = PAGESIZE;
-        return (0);
-    }
-    return (EFAULT);
-}
-
-static int up_mapout(uio_t *uiop, page_t *pp) {
-    u_offset_t off;
-    size_t size;
-    pgcnt_t npages;
-    caddr_t kaddr;
-
-    kaddr = uiop->uio_iov->iov_base;
-    off = (uintptr_t) kaddr & PAGEOFFSET;
-    size = P2ROUNDUP(uiop->uio_iov->iov_len + off, PAGESIZE);
-    npages = btop(size);
-
-    if (npages == 1 && kpm_enable) {
-        kaddr = (caddr_t) ((uintptr_t) kaddr & MMU_PAGEMASK);
-        hat_kpm_mapout(pp, NULL, kaddr);
-        uiop->uio_iov->iov_base = 0;
-        uiop->uio_iov->iov_len = 0;
-        return (0);
-    }
-    return (EFAULT);
 }
 
 static int smbfs_getpage(vnode_t *vp, offset_t off, size_t len, uint_t *protp,
         page_t *pl[], size_t plsz, struct seg *seg, caddr_t addr,
         enum seg_rw rw, cred_t *cr, caller_context_t *ct) {
     int error;
-    smbnode_t *np;
+    //smbnode_t *np;
 
-    np = VTOSMB(vp);
+    // np = VTOSMB(vp);
 
+    /*
     mutex_enter(&np->r_statelock);
     if (off + len > np->r_size + PAGEOFFSET && seg != segkmap) {
         mutex_exit(&np->r_statelock);
         return (EFAULT);
     }
     mutex_exit(&np->r_statelock);
+     */
+
+    /*these pages have all protections.*/
+    if (protp)
+        *protp = PROT_ALL;
 
     if (len <= PAGESIZE) {
         error = smbfs_getapage(vp, off, len, protp, pl, plsz, seg, addr, rw,
@@ -3402,6 +3439,7 @@ static int smbfs_getpage(vnode_t *vp, offset_t off, size_t len, uint_t *protp,
         error = pvn_getpages(smbfs_getapage, vp, off, len, protp, pl, plsz, seg,
                 addr, rw, cr);
     }
+
     return (error);
 }
 
@@ -3414,50 +3452,95 @@ static int smbfs_getapage(vnode_t *vp, u_offset_t off, size_t len,
     smb_share_t *ssp;
     smb_cred_t scred;
 
-    page_t *pagefound, *pp;
+    page_t *pp;
     uio_t uio;
-    iovec_t uiov;
+    iovec_t uiov, uiov_bak;
 
-    int error = 0, timo;
+    u_offset_t blkoff;
+    size_t bsize;
+    size_t blksize;
+
+    u_offset_t io_off;
+    size_t io_len;
+    size_t pages_len;
+
+    int error = 0;
 
     np = VTOSMB(vp);
     smi = VTOSMI(vp);
     ssp = smi->smi_share;
 
-    if (len > PAGESIZE)
-        return (EFAULT);
-    len = PAGESIZE;
-
+    /*if pl is null,it's meaningless*/
     if (pl == NULL)
         return (EFAULT);
 
-    if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_READER, SMBINTR(vp)))
-        return EINTR;
-
-    smb_credinit(&scred, cr);
-
 again:
-    if ((pagefound = page_exists(vp, off)) == NULL) {
-        if ((pp = page_create_va(vp, off, PAGESIZE, PG_WAIT | PG_EXCL, seg, addr)) == NULL)
-            goto again;
+    if (page_exists(vp, off) == NULL) {
         if (rw == S_CREATE) {
-            goto out;
+            /*just return a empty page if asked to create.*/
+            if ((pp = page_create_va(vp, off, PAGESIZE, PG_WAIT | PG_EXCL, seg, addr)) == NULL)
+                goto again;
+            pages_len = PAGESIZE;
         } else {
-            timo = smb_timo_read;
 
+            /*do block io, get a kluster of non-exist pages in a block.*/
+            bsize = MAX(vp->v_vfsp->vfs_bsize, PAGESIZE);
+            blkoff = off / bsize;
+            blkoff *= bsize;
+            blksize = roundup(bsize, PAGESIZE);
+
+            pp = pvn_read_kluster(vp, off, seg, addr, &io_off, &io_len, blkoff, blksize, 0);
+
+            if (pp == NULL)
+                goto again;
+
+            pages_len = io_len;
+
+            /*currently, don't allow get pages beyond EOF, unless smbfs_read/smbfs_write
+             *can do io through segkpm or vpm.*/
+            mutex_enter(&np->r_statelock);
+            if (io_off >= np->r_size) {
+                mutex_exit(&np->r_statelock);
+                error = 0;
+                goto out;
+            } else if (io_off + io_len > np->r_size) {
+                int npages = btopr(np->r_size - io_off);
+                page_t *trunc;
+
+                page_list_break(&pp, &trunc, npages);
+                if (trunc)
+                    pvn_read_done(trunc, 0);
+                io_len = np->r_size - io_off;
+            }
+            mutex_exit(&np->r_statelock);
+
+            if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_READER, SMBINTR(vp)))
+                return EINTR;
+            smb_credinit(&scred, cr);
+
+            /*just use uio instead of buf, since smb_rwuio need uio.*/
             uiov.iov_base = 0;
             uiov.iov_len = 0;
             uio.uio_iov = &uiov;
             uio.uio_iovcnt = 1;
-            uio.uio_loffset = off;
-            uio.uio_resid = len;
+            uio.uio_loffset = io_off;
+            uio.uio_resid = io_len;
             uio.uio_segflg = UIO_SYSSPACE;
             uio.uio_llimit = MAXOFFSET_T;
-            error = up_mapin(&uio, pp);
+
+            /*map pages into kernel address space, and setup uio.*/
+            error = uio_page_mapin(&uio, pp);
             if (error == 0) {
-                error = smb_rwuio(ssp, np->n_fid, UIO_READ, &uio, &scred, timo);
-                up_mapout(&uio, pp);
+                uiov_bak.iov_base = uiov.iov_base;
+                uiov_bak.iov_len = uiov.iov_len;
+                error = smb_rwuio(ssp, np->n_fid, UIO_READ, &uio, &scred, smb_timo_read);
+                /*unmap pages from kernel address space.*/
+                uio.uio_iov = &uiov_bak;
+                uio_page_mapout(&uio, pp);
             }
+
+            smb_credrele(&scred);
+            smbfs_rw_exit(&np->r_lkserlock);
         }
     } else {
         se_t se = rw == S_CREATE ? SE_EXCL : SE_SHARED;
@@ -3468,11 +3551,10 @@ again:
 
 out:
     if (pp) {
-        pvn_plist_init(pp, pl, plsz, off, PAGESIZE, rw);
+        /*init page list, unlock pages.*/
+        pvn_plist_init(pp, pl, plsz, off, pages_len, rw);
     }
-
-    smb_credrele(&scred);
-    smbfs_rw_exit(&np->r_lkserlock);
 
     return (error);
 }
+
