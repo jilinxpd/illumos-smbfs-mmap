@@ -518,7 +518,35 @@ smbfs_close(vnode_t *vp, int flag, int count, offset_t offset, cred_t *cr,
 	(void) smbfs_rw_enter_sig(&np->r_lkserlock, RW_WRITER, 0);
 	smb_credinit(&scred, cr);
 
-	smbfs_rele_fid(np, &scred);
+	/*
+	 * If FID ref. count is 1 and count of mmaped pages isn't 0,
+	 * we won't call smbfs_rele_fid(), because it will result in the otW close.
+	 * The count of mapped pages isn't 0, which means the mapped pages
+	 * possibly will be accessed after close(), we should keep the FID valid,
+	 * i.e., dont do the otW close.
+	 * Dont worry that FID will be leaked, because when the
+	 * vnode's count becomes 0, smbfs_inactive() will
+	 * help us release FID and eventually do the otW close.
+	 */
+	if (np->n_fidrefs > 1) {
+		smbfs_rele_fid(np, &scred);
+	} else if (np->r_mapcnt == 0) {
+		/*
+		 * Before otW close, make sure dirty pages written back.
+		 */
+		if ((flag & FWRITE) && vn_has_cached_data(vp)) {
+			/* smbfs_putapage() will acquire shared lock, so release
+		 	 * exclusive lock temporally.
+		 	 */
+			smbfs_rw_exit(&np->r_lkserlock);
+
+			smbfs_putpage(vp, (offset_t) 0, 0, B_INVAL | B_ASYNC, cr, ct);
+
+			/* acquire exclusive lock again. */
+			(void) smbfs_rw_enter_sig(&np->r_lkserlock, RW_WRITER, 0);
+		}
+		smbfs_rele_fid(np, &scred);
+	}
 
 	smb_credrele(&scred);
 	smbfs_rw_exit(&np->r_lkserlock);
@@ -1397,6 +1425,20 @@ smbfs_inactive(vnode_t *vp, cred_t *cr, caller_context_t *ct)
 			break;
 		SMBVDEBUG("open file: refs %d id 0x%x path %s\n",
 		    np->n_fidrefs, np->n_fid, np->n_rpath);
+		/*
+		 * Before otW close, make sure dirty pages written back.
+		 */
+		if (vn_has_cached_data(vp)) {
+			/* smbfs_putapage() will acquire shared lock, so release
+			 * exclusive lock temporally.
+			 */
+			smbfs_rw_exit(&np->r_lkserlock);
+
+			smbfs_putpage(vp, (offset_t) 0, 0, B_INVAL | B_ASYNC, cr, ct);
+
+			/* acquire exclusive lock again. */
+			(void) smbfs_rw_enter_sig(&np->r_lkserlock, RW_WRITER, 0);
+		}
 		/* Force last close. */
 		np->n_fidrefs = 1;
 		smbfs_rele_fid(np, &scred);
@@ -3407,6 +3449,11 @@ static int smbfs_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp, size_t *len
 
 out:
     pvn_write_done(pp, ((error) ? B_ERROR : 0) | B_WRITE | flags);
+
+    if (offp)
+        *offp = off;
+    if (lenp)
+        *lenp = len;
 
     return (error);
 }
