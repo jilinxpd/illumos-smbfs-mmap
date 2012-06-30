@@ -252,6 +252,7 @@ const fs_operation_def_t smbfs_vnodeops_template[] = {
 	{ VOPNAME_MAP,		{ .vop_map = smbfs_map } }, /* smbfs_map, */
 	{ VOPNAME_ADDMAP,	{ .vop_addmap = smbfs_addmap } }, /* smbfs_addmap, */
 	{ VOPNAME_DELMAP,	{ .vop_delmap = smbfs_delmap } }, /* smbfs_delmap, */
+	{ VOPNAME_DISPOSE,	{ .vop_dispose = fs_dispose}},
 	{ VOPNAME_DUMP,		{ .error = fs_nosys } }, /* smbfs_dump, */
 	{ VOPNAME_PATHCONF,	{ .vop_pathconf = smbfs_pathconf } },
 	{ VOPNAME_PAGEIO,	{ .error = fs_nosys } }, /* smbfs_pageio, */
@@ -3388,31 +3389,48 @@ static int smbfs_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp, size_t *len
     uio_t uio;
     iovec_t uiov, uiov_bak;
 
-    u_offset_t off;
-    size_t len;
-    int error, timo;
+    size_t io_len;
+    u_offset_t io_off;
+    size_t bsize;
+    size_t blksize;
+    u_offset_t blkoff;
+    int error;
 
     np = VTOSMB(vp);
     smi = VTOSMI(vp);
     ssp = smi->smi_share;
 
-    off = pp->p_offset;
-    len = PAGESIZE;
+    /*do block io, get a kluster of dirty pages in a block.*/
+    bsize = MAX(vp->v_vfsp->vfs_bsize, PAGESIZE);
+    blkoff = pp->p_offset / bsize;
+    blkoff *= bsize;
+    blksize = roundup(bsize, PAGESIZE);
 
-    if (off >= np->r_size) {
+    pp = pvn_write_kluster(vp, pp, &io_off, &io_len, blkoff, blksize, flags);
+
+    ASSERT(pp->p_offset >= blkoff);
+
+    if (io_off + io_len > blkoff + blksize) {
+        ASSERT((io_off + io_len)-(blkoff + blksize) < PAGESIZE);
+        io_len = blkoff + blksize - io_off;
+    }
+
+    /*currently, don't allow put pages beyond EOF, unless smbfs_read/smbfs_write
+     *can do io through segkpm or vpm.*/
+    mutex_enter(&np->r_statelock);
+    if (io_off >= np->r_size) {
+        mutex_exit(&np->r_statelock);
         error = 0;
         goto out;
-    } else if (off + len > np->r_size) {
-        int npages = btopr(np->r_size - off);
+    } else if (io_off + io_len > np->r_size) {
+        int npages = btopr(np->r_size - io_off);
         page_t *trunc;
-
         page_list_break(&pp, &trunc, npages);
         if (trunc)
             pvn_write_done(trunc, flags);
-        len = np->r_size - off;
+        io_len = np->r_size - io_off;
     }
-
-    timo = smb_timo_write;
+    mutex_exit(&np->r_statelock);
 
     if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_READER, SMBINTR(vp)))
         return (EINTR);
@@ -3421,29 +3439,33 @@ static int smbfs_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp, size_t *len
     if (np->n_vcgenid != ssp->ss_vcgenid)
         error = ESTALE;
     else {
+        /*just use uio instead of buf, since smb_rwuio need uio.*/
         uiov.iov_base = 0;
         uiov.iov_len = 0;
         uio.uio_iov = &uiov;
         uio.uio_iovcnt = 1;
-        uio.uio_loffset = off;
-        uio.uio_resid = len;
+        uio.uio_loffset = io_off;
+        uio.uio_resid = io_len;
         uio.uio_segflg = UIO_SYSSPACE;
         uio.uio_llimit = MAXOFFSET_T;
+        /*map pages into kernel address space, and setup uio.*/
         error = uio_page_mapin(&uio, pp);
         if (error == 0) {
             uiov_bak.iov_base = uiov.iov_base;
             uiov_bak.iov_len = uiov.iov_len;
-            error = smb_rwuio(ssp, np->n_fid, UIO_WRITE, &uio, &scred, timo);
+            error = smb_rwuio(ssp, np->n_fid, UIO_WRITE, &uio, &scred, smb_timo_write);
             if (error == 0) {
                 mutex_enter(&np->r_statelock);
                 np->n_flag |= (NFLUSHWIRE | NATTRCHANGED);
                 mutex_exit(&np->r_statelock);
                 (void) smbfs_smb_flush(np, &scred);
             }
+            /*unmap pages from kernel address space.*/
             uio.uio_iov = &uiov_bak;
             uio_page_mapout(&uio, pp);
         }
     }
+
     smb_credrele(&scred);
     smbfs_rw_exit(&np->r_lkserlock);
 
@@ -3451,9 +3473,9 @@ out:
     pvn_write_done(pp, ((error) ? B_ERROR : 0) | B_WRITE | flags);
 
     if (offp)
-        *offp = off;
+        *offp = io_off;
     if (lenp)
-        *lenp = len;
+        *lenp = io_len;
 
     return (error);
 }
