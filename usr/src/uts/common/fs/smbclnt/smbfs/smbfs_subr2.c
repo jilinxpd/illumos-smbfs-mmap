@@ -157,6 +157,7 @@ sn_inactive(smbnode_t *np)
 	cred_t		*oldcr;
 	char 		*orpath;
 	int		orplen;
+	vnode_t		*vp;
 
 	/*
 	 * Flush and invalidate all pages (todo)
@@ -178,6 +179,11 @@ sn_inactive(smbnode_t *np)
 	np->n_rplen = 0;
 
 	mutex_exit(&np->r_statelock);
+
+	vp = SMBTOV(np);
+	if (vn_has_cached_data(vp)) {
+		(void) pvn_vplist_dirty(vp, 0, vp->v_op->vop_putpage, B_INVAL | B_TRUNC, oldcr);
+	}
 
 	if (ovsa.vsa_aclentp != NULL)
 		kmem_free(ovsa.vsa_aclentp, ovsa.vsa_aclentsz);
@@ -1042,7 +1048,39 @@ sn_destroy_node(smbnode_t *np)
 void
 smbfs_rflush(struct vfs *vfsp, cred_t *cr)
 {
-	/* Todo: mmap support. */
+    smbmntinfo_t *mi;
+    smbnode_t *np;
+    vnode_t *vp;
+    vnode_t **vplist;
+    long num, cnt;
+
+    mi = VFTOSMI(vfsp);
+
+    cnt = 0;
+    num = mi->smi_hash_avl.avl_numnodes;
+    vplist = kmem_alloc(num * sizeof (vnode_t*), KM_SLEEP);
+
+    for (np = avl_first(&mi->smi_hash_avl); np != NULL;
+            np = avl_walk(&mi->smi_hash_avl, np, AVL_AFTER)
+            ) {
+        vp = SMBTOV(np);
+        if (vn_is_readonly(vp))
+            continue;
+
+        if (vn_has_cached_data(vp) && (np->r_flags & RDIRTY || np->r_mapcnt > 0)) {
+            VN_HOLD(vp);
+            vplist[cnt++] = vp;
+            if (cnt == num)
+                break;
+        }
+    }
+    while (cnt-- > 0) {
+        vp = vplist[cnt];
+        VOP_PUTPAGE(vp, 0, 0, 0, cr, NULL);
+        VN_RELE(vp);
+    }
+
+    kmem_free(vplist, num * sizeof (vnode_t*));
 }
 
 /* access cache */

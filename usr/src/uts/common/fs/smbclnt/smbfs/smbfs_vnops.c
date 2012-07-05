@@ -3331,7 +3331,17 @@ static int smbfs_addmap(vnode_t *vp, offset_t off, struct as *as, caddr_t addr,
 static int smbfs_delmap(vnode_t *vp, offset_t off, struct as *as, caddr_t addr,
         size_t len, uint_t prot, uint_t maxprot, uint_t flags, cred_t *cr,
         caller_context_t *ct) {
+
+    smbnode_t *np;
+
     atomic_add_long((ulong_t *) & VTOSMB(vp)->r_mapcnt, -btopr(len));
+
+    if (vn_has_cached_data(vp) && !vn_is_readonly(vp) && maxprot & PROT_WRITE && flags == MAP_SHARED) {
+        np = VTOSMB(vp);
+        mutex_enter(&np->r_statelock);
+        np->r_flags |= RDIRTY;
+        mutex_exit(&np->r_statelock);
+    }
     return (0);
 }
 
@@ -3348,6 +3358,13 @@ static int smbfs_putpage(vnode_t *vp, offset_t off, size_t len, int flags,
     np = VTOSMB(vp);
 
     if (len == 0) {
+
+        if (off == (u_offset_t) 0 && (np->r_flags & RDIRTY)) {
+            mutex_enter(&np->r_statelock);
+            np->r_flags &= ~RDIRTY;
+            mutex_exit(&np->r_statelock);
+        }
+
         error = pvn_vplist_dirty(vp, off, smbfs_putapage, flags, cr);
     } else {
 
@@ -3620,8 +3637,12 @@ again:
 
 out:
     if (pp) {
-        /*init page list, unlock pages.*/
-        pvn_plist_init(pp, pl, plsz, off, pages_len, rw);
+        if (error) {
+            pvn_read_done(pp, B_ERROR);
+        } else {
+            /*init page list, unlock pages.*/
+            pvn_plist_init(pp, pl, plsz, off, pages_len, rw);
+        }
     }
 
     return (error);
