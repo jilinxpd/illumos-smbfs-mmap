@@ -253,6 +253,8 @@ void smbfs_cache_check(struct vnode *vp, struct smbfattr *fap);
 void smbfs_addfree(struct smbnode *sp);
 void smbfs_rmhash(struct smbnode *);
 
+void smbfs_invalidate_pages(vnode_t *vp, u_offset_t off, cred_t *cr);
+
 /* See avl_create in smbfs_vfsops.c */
 void smbfs_init_hash_avl(avl_tree_t *);
 

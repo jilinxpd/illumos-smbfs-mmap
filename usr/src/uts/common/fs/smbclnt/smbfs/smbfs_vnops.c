@@ -51,6 +51,18 @@
 #include <sys/vfs_opreg.h>
 #include <sys/policy.h>
 
+#include <sys/param.h>
+#include <sys/vm.h>
+#include <vm/seg_vn.h>
+#include <vm/pvn.h>
+#include <vm/as.h>
+#include <vm/hat.h>
+#include <vm/page.h>
+#include <vm/seg.h>
+#include <vm/seg_map.h>
+#include <vm/seg_kmem.h>
+#include <vm/seg_kpm.h>
+
 #include <netsmb/smb_osdep.h>
 #include <netsmb/smb.h>
 #include <netsmb/smb_conn.h>
@@ -541,7 +553,7 @@ smbfs_close(vnode_t *vp, int flag, int count, offset_t offset, cred_t *cr,
 		 	 */
 			smbfs_rw_exit(&np->r_lkserlock);
 
-			smbfs_putpage(vp, (offset_t) 0, 0, B_INVAL | B_ASYNC, cr, ct);
+			(void) smbfs_putpage(vp, (offset_t) 0, 0, B_INVAL | B_ASYNC, cr, ct);
 
 			/* acquire exclusive lock again. */
 			(void) smbfs_rw_enter_sig(&np->r_lkserlock, RW_WRITER, 0);
@@ -1435,7 +1447,7 @@ smbfs_inactive(vnode_t *vp, cred_t *cr, caller_context_t *ct)
 			 */
 			smbfs_rw_exit(&np->r_lkserlock);
 
-			smbfs_putpage(vp, (offset_t) 0, 0, B_INVAL | B_ASYNC, cr, ct);
+			(void) smbfs_putpage(vp, (offset_t) 0, 0, B_INVAL | B_ASYNC, cr, ct);
 
 			/* acquire exclusive lock again. */
 			(void) smbfs_rw_enter_sig(&np->r_lkserlock, RW_WRITER, 0);
@@ -3261,7 +3273,6 @@ static int smbfs_map(vnode_t *vp, offset_t off, struct as *as, caddr_t *addrp,
     smbnode_t *np;
     smbmntinfo_t *smi;
     struct vattr va;
-    struct smb_cred scred;
     segvn_crargs_t vn_a;
     int error;
 
@@ -3500,19 +3511,8 @@ out:
 static int smbfs_getpage(vnode_t *vp, offset_t off, size_t len, uint_t *protp,
         page_t *pl[], size_t plsz, struct seg *seg, caddr_t addr,
         enum seg_rw rw, cred_t *cr, caller_context_t *ct) {
+
     int error;
-    //smbnode_t *np;
-
-    // np = VTOSMB(vp);
-
-    /*
-    mutex_enter(&np->r_statelock);
-    if (off + len > np->r_size + PAGEOFFSET && seg != segkmap) {
-        mutex_exit(&np->r_statelock);
-        return (EFAULT);
-    }
-    mutex_exit(&np->r_statelock);
-     */
 
     /*these pages have all protections.*/
     if (protp)
@@ -3647,4 +3647,20 @@ out:
 
     return (error);
 }
+
+
+void smbfs_invalidate_pages(vnode_t *vp, u_offset_t off, cred_t *cr) {
+
+    smbnode_t *np;
+
+    np = VTOSMB(vp);
+    if (off == (u_offset_t) 0 && (np->r_flags & RDIRTY)) {
+        mutex_enter(&np->r_statelock);
+        np->r_flags &= ~RDIRTY;
+        mutex_exit(&np->r_statelock);
+    }
+
+    (void) pvn_vplist_dirty(vp, off, smbfs_putapage, B_INVAL | B_TRUNC, cr);
+}
+
 

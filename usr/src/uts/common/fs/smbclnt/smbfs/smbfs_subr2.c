@@ -182,7 +182,7 @@ sn_inactive(smbnode_t *np)
 
 	vp = SMBTOV(np);
 	if (vn_has_cached_data(vp)) {
-		(void) pvn_vplist_dirty(vp, 0, vp->v_op->vop_putpage, B_INVAL | B_TRUNC, oldcr);
+		smbfs_invalidate_pages(vp, (u_offset_t) 0, oldcr);
 	}
 
 	if (ovsa.vsa_aclentp != NULL)
@@ -1046,13 +1046,15 @@ sn_destroy_node(smbnode_t *np)
  */
 /*ARGSUSED*/
 void
-smbfs_rflush(struct vfs *vfsp, cred_t *cr)
-{
+smbfs_rflush(struct vfs *vfsp, cred_t *cr) {
+
     smbmntinfo_t *mi;
     smbnode_t *np;
     vnode_t *vp;
-    vnode_t **vplist;
+
     long num, cnt;
+
+    vnode_t **vplist;
 
     mi = VFTOSMI(vfsp);
 
@@ -1060,9 +1062,9 @@ smbfs_rflush(struct vfs *vfsp, cred_t *cr)
     num = mi->smi_hash_avl.avl_numnodes;
     vplist = kmem_alloc(num * sizeof (vnode_t*), KM_SLEEP);
 
+    rw_enter(&mi->smi_hash_lk, RW_READER);
     for (np = avl_first(&mi->smi_hash_avl); np != NULL;
-            np = avl_walk(&mi->smi_hash_avl, np, AVL_AFTER)
-            ) {
+            np = avl_walk(&mi->smi_hash_avl, np, AVL_AFTER)) {
         vp = SMBTOV(np);
         if (vn_is_readonly(vp))
             continue;
@@ -1074,9 +1076,11 @@ smbfs_rflush(struct vfs *vfsp, cred_t *cr)
                 break;
         }
     }
+    rw_exit(&mi->smi_hash_lk);
+
     while (cnt-- > 0) {
         vp = vplist[cnt];
-        VOP_PUTPAGE(vp, 0, 0, 0, cr, NULL);
+        (void) VOP_PUTPAGE(vp, 0, 0, 0, cr, NULL);
         VN_RELE(vp);
     }
 
