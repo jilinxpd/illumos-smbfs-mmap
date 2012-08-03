@@ -235,6 +235,7 @@ typedef struct smbnode {
 	uint_t		r_count;	/* # of refs not reflect in v_count */
 	uint_t		r_awcount;	/* # of outstanding async write */
 	uint_t		r_gcount;	/* getattrs waiting to flush pages */
+	u_offset_t	r_modaddr;	/* address for page in writenp */
 	uint_t		r_flags;	/* flags, see below */
 	uint32_t	n_flag;		/* NXXX flags below */
 	uint_t		r_error;	/* async write error */

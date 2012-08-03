@@ -217,7 +217,7 @@ static int smbfs_getapage(vnode_t *vp, u_offset_t off, size_t len,
         uint_t *protp, page_t *pl[], size_t plsz, struct seg *seg, caddr_t addr,
         enum seg_rw rw, cred_t *cr);
 
-
+static int writenp(smbnode_t *np, caddr_t base, int tcount, struct uio *uiop, int pgcreated);
 
 /* Dummy function to use until correct function is ported in */
 int noop_vnodeop() {
@@ -646,7 +646,497 @@ smbfs_rele_fid(smbnode_t *np, struct smb_cred *scred)
 		crfree(oldcr);
 }
 
+/* ARGSUSED */
+static int
+smbfs_read(vnode_t * vp, struct uio * uiop, int ioflag, cred_t * cr,
+	   caller_context_t * ct)
+{
+	struct smb_cred scred;
+	struct vattr    va;
+	smbnode_t      *np;
+	smbmntinfo_t   *smi;
+	smb_share_t    *ssp;
+	offset_t        endoff;
+	ssize_t         past_eof;
+	int             error;
 
+	caddr_t         base;
+	u_offset_t      blk;
+	u_offset_t      boff;
+	size_t          blen;
+	uint_t          flags;
+
+	np = VTOSMB(vp);
+	smi = VTOSMI(vp);
+	ssp = smi->smi_share;
+
+	if (curproc->p_zone != smi->smi_zone_ref.zref_zone)
+		return (EIO);
+
+	if (smi->smi_flags & SMI_DEAD || vp->v_vfsp->vfs_flag & VFS_UNMOUNTED)
+		return (EIO);
+
+	ASSERT(smbfs_rw_lock_held(&np->r_rwlock, RW_READER));
+
+	if (vp->v_type != VREG)
+		return (EISDIR);
+
+	if (uiop->uio_resid == 0)
+		return (0);
+
+	/*
+	 * Like NFS3, just check for 63-bit overflow. Our SMB layer takes
+	 * care to return EFBIG when it has to fallback to a 32-bit call.
+	 */
+	endoff = uiop->uio_loffset + uiop->uio_resid;
+	if (uiop->uio_loffset < 0 || endoff < 0)
+		return (EINVAL);
+
+	/* get vnode attributes from server */
+	va.va_mask = AT_SIZE | AT_MTIME;
+	if (error = smbfsgetattr(vp, &va, cr))
+		return (error);
+
+	/* Update mtime with mtime from server here? */
+
+	/* if offset is beyond EOF, read nothing */
+	if (uiop->uio_loffset >= va.va_size)
+		return (0);
+
+	/*
+	 * Limit the read to the remaining file size. Do this by temporarily
+	 * reducing uio_resid by the amount the lies beyoned the EOF.
+	 */
+	if (endoff > va.va_size) {
+		past_eof = (ssize_t) (endoff - va.va_size);
+		uiop->uio_resid -= past_eof;
+	} else
+		past_eof = 0;
+
+	/* Bypass the VM if vnode is non-cacheable. */
+	if ((vp->v_flag & VNOCACHE) ||
+	    ((np->r_flags & RDIRECTIO) &&
+	     np->r_mapcnt == 0 &&
+	     !(vn_has_cached_data(vp)))) {
+
+		/* Shared lock for n_fid use in smb_rwuio */
+		if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_READER, SMBINTR(vp)))
+			return (EINTR);
+		smb_credinit(&scred, cr);
+
+		/* After reconnect, n_fid is invalid */
+		if (np->n_vcgenid != ssp->ss_vcgenid)
+			error = ESTALE;
+		else
+			error = smb_rwuio(ssp, np->n_fid, UIO_READ,
+					  uiop, &scred, smb_timo_read);
+
+		smb_credrele(&scred);
+		smbfs_rw_exit(&np->r_lkserlock);
+
+	} else {
+
+		/* Do I/O through segmap. */
+		do {
+			blk = uiop->uio_loffset & MAXBMASK;
+			boff = uiop->uio_loffset & MAXBOFFSET;
+			blen = MIN(MAXBSIZE - boff, uiop->uio_resid);
+
+			if (vpm_enable) {
+
+				error = vpm_data_copy(vp, blk + boff, blen, uiop, 1, NULL, 0, S_READ);
+
+			} else {
+
+				base = segmap_getmapflt(segkmap, vp, blk + boff, blen, 1, S_READ);
+
+				error = uiomove(base + boff, blen, UIO_READ, uiop);
+			}
+
+			if (!error) {
+				mutex_enter(&np->r_statelock);
+				if ((blen + boff == MAXBSIZE) || (uiop->uio_loffset == np->r_size)) {
+					flags = SM_DONTNEED;
+				} else {
+					flags = 0;
+				}
+				mutex_exit(&np->r_statelock);
+			} else {
+				flags = 0;
+			}
+			if (vpm_enable) {
+				(void) vpm_sync_pages(vp, blk + boff, blen, flags);
+			} else {
+				(void) segmap_release(segkmap, base, flags);
+			}
+		} while (!error && uiop->uio_resid > 0);
+	}
+
+	/* undo adjustment of resid */
+	uiop->uio_resid += past_eof;
+
+	return (error);
+}
+
+/* ARGSUSED */
+static int
+smbfs_write(vnode_t * vp, struct uio * uiop, int ioflag, cred_t * cr,
+	    caller_context_t * ct)
+{
+	struct smb_cred scred;
+	struct vattr    va;
+	smbnode_t      *np;
+	smbmntinfo_t   *smi;
+	smb_share_t    *ssp;
+	offset_t        endoff, limit;
+	ssize_t         past_limit;
+	int             error, timo;
+
+	caddr_t         base;
+	u_offset_t      blk;
+	u_offset_t      boff;
+	size_t          blen;
+	uint_t          flags;
+
+	u_offset_t      last_off;
+	size_t          last_resid;
+
+	np = VTOSMB(vp);
+	smi = VTOSMI(vp);
+	ssp = smi->smi_share;
+
+	if (curproc->p_zone != smi->smi_zone_ref.zref_zone)
+		return (EIO);
+
+	if (smi->smi_flags & SMI_DEAD || vp->v_vfsp->vfs_flag & VFS_UNMOUNTED)
+		return (EIO);
+
+	ASSERT(smbfs_rw_lock_held(&np->r_rwlock, RW_WRITER));
+
+	if (vp->v_type != VREG)
+		return (EISDIR);
+
+	if (uiop->uio_resid == 0)
+		return (0);
+
+	/*
+	 * Handle ioflag bits: (FAPPEND|FSYNC|FDSYNC)
+	 */
+	if (ioflag & (FAPPEND | FSYNC)) {
+		if (np->n_flag & NMODIFIED) {
+			smbfs_attrcache_remove(np);
+			/* XXX: smbfs_vinvalbuf? */
+		}
+	}
+	if (ioflag & FAPPEND) {
+		/*
+		 * File size can be changed by another client
+		 */
+		va.va_mask = AT_SIZE;
+		if (error = smbfsgetattr(vp, &va, cr))
+			return (error);
+		uiop->uio_loffset = va.va_size;
+	}
+	/*
+	 * Like NFS3, just check for 63-bit overflow.
+	 */
+	endoff = uiop->uio_loffset + uiop->uio_resid;
+	if (uiop->uio_loffset < 0 || endoff < 0)
+		return (EINVAL);
+
+	/*
+	 * Check to make sure that the process will not exceed its limit on
+	 * file size.  It is okay to write up to the limit, but not beyond.
+	 * Thus, the write which reaches the limit will be short and the next
+	 * write will return an error.
+	 * 
+	 * So if we're starting at or beyond the limit, EFBIG. Otherwise,
+	 * temporarily reduce resid to the amount the falls after the limit.
+	 */
+	limit = uiop->uio_llimit;
+	if (limit == RLIM64_INFINITY || limit > MAXOFFSET_T)
+		limit = MAXOFFSET_T;
+	if (uiop->uio_loffset >= limit)
+		return (EFBIG);
+	if (endoff > limit) {
+		past_limit = (ssize_t) (endoff - limit);
+		uiop->uio_resid -= past_limit;
+	} else
+		past_limit = 0;
+
+	/* Bypass the VM if vnode is non-cacheable. */
+	if ((vp->v_flag & VNOCACHE) ||
+	    ((np->r_flags & RDIRECTIO) &&
+	     np->r_mapcnt == 0 &&
+	     !(vn_has_cached_data(vp)))) {
+
+		/* Timeout: longer for append. */
+		timo = smb_timo_write;
+		if (endoff > np->r_size)
+			timo = smb_timo_append;
+
+		/* Shared lock for n_fid use in smb_rwuio */
+		if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_READER, SMBINTR(vp)))
+			return (EINTR);
+		smb_credinit(&scred, cr);
+
+		/* After reconnect, n_fid is invalid */
+		if (np->n_vcgenid != ssp->ss_vcgenid)
+			error = ESTALE;
+		else
+			error = smb_rwuio(ssp, np->n_fid, UIO_WRITE,
+					  uiop, &scred, timo);
+
+		if (error == 0) {
+			mutex_enter(&np->r_statelock);
+			np->n_flag |= (NFLUSHWIRE | NATTRCHANGED);
+			if (uiop->uio_loffset > (offset_t) np->r_size)
+				np->r_size = (len_t) uiop->uio_loffset;
+			mutex_exit(&np->r_statelock);
+			if (ioflag & (FSYNC | FDSYNC)) {
+				/* Don't error the I/O if this fails. */
+				(void) smbfs_smb_flush(np, &scred);
+			}
+		}
+		smb_credrele(&scred);
+		smbfs_rw_exit(&np->r_lkserlock);
+
+	} else {
+
+		/* Do I/O through segmap. */
+		size_t          bsize = vp->v_vfsp->vfs_bsize;
+
+		do {
+			blk = uiop->uio_loffset & MAXBMASK;
+			boff = uiop->uio_loffset & MAXBOFFSET;
+			blen = MIN(MAXBSIZE - boff, uiop->uio_resid);
+
+			last_off = uiop->uio_loffset;
+			last_resid = uiop->uio_resid;
+
+			uio_prefaultpages((ssize_t) blen, uiop);
+
+			if (vpm_enable) {
+
+				error = writenp(np, NULL, blen, uiop, 0);
+
+			} else {
+
+				if (segmap_kpm) {
+					u_offset_t      poff = uiop->uio_loffset & PAGEOFFSET;
+					size_t          plen = MIN(PAGESIZE - poff, uiop->uio_resid);
+
+					int             pagecreate;
+
+					mutex_enter(&np->r_statelock);
+					pagecreate = (poff == 0) &&
+						((plen == PAGESIZE) ||
+						 (uiop->uio_loffset + plen >= np->r_size));
+					mutex_exit(&np->r_statelock);
+
+					base = segmap_getmapflt(segkmap, vp, blk + boff, plen, !pagecreate, S_WRITE);
+					error = writenp(np, base + poff, blen, uiop, pagecreate);
+
+				} else {
+					base = segmap_getmapflt(segkmap, vp, blk + boff, blen, 0, S_READ);
+					error = writenp(np, base + boff, blen, uiop, 0);
+				}
+			}
+
+			if (!error) {
+				if (uiop->uio_loffset % bsize == 0) {
+					flags = SM_WRITE | SM_ASYNC | SM_DONTNEED;
+				} else {
+					flags = 0;
+				}
+
+				if (ioflag & (FSYNC | FDSYNC)) {
+					flags &= ~SM_ASYNC;
+					flags |= SM_WRITE;
+				}
+				if (vpm_enable) {
+					error = vpm_sync_pages(vp, blk, blen, flags);
+				} else {
+					error = segmap_release(segkmap, base, flags);
+				}
+			} else {
+				if (vpm_enable) {
+					(void) vpm_sync_pages(vp, blk, blen, 0);
+				} else {
+					(void) segmap_release(segkmap, base, 0);
+				}
+			}
+		} while (!error && uiop->uio_resid > 0);
+	}
+
+	/* undo adjustment of resid */
+	if (error) {
+		uiop->uio_resid = last_resid + past_limit;
+		uiop->uio_loffset = last_off;
+	} else {
+		uiop->uio_resid += past_limit;
+	}
+
+	return (error);
+}
+
+/* correspond to writerp() in nfs_client.c */
+static int
+writenp(smbnode_t * np, caddr_t base, int tcount, struct uio * uiop, int pgcreated)
+{
+	int             pagecreate;
+	int             n;
+	int             saved_n;
+	caddr_t         saved_base;
+	u_offset_t      offset;
+	int             error;
+	int             sm_error;
+
+	vnode_t        *vp = SMBTOV(np);
+
+	ASSERT(tcount <= MAXBSIZE && tcount <= uiop->uio_resid);
+	ASSERT(smbfs_rw_lock_held(&np->r_rwlock, RW_WRITER));
+	if (!vpm_enable) {
+		ASSERT(((uintptr_t) base & MAXBOFFSET) + tcount <= MAXBSIZE);
+	}
+	/*
+	 * Move bytes in at most PAGESIZE chunks. We must avoid spanning
+	 * pages in uiomove() because page faults may cause the cache to be
+	 * invalidated out from under us. The r_size is not updated until
+	 * after the uiomove. If we push the last page of a file before
+	 * r_size is correct, we will lose the data written past the current
+	 * (and invalid) r_size.
+	 */
+	do {
+		offset = uiop->uio_loffset;
+		pagecreate = 0;
+
+		/*
+		 * n is the number of bytes required to satisfy the request
+		 * or the number of bytes to fill out the page.
+		 */
+		n = (int) MIN((PAGESIZE - (offset & PAGEOFFSET)), tcount);
+
+		/*
+		 * Check to see if we can skip reading in the page and just
+		 * allocate the memory. We can do this if we are going to
+		 * rewrite the entire mapping or if we are going to write to
+		 * or beyond the current end of file from the beginning of
+		 * the mapping.
+		 * 
+		 * The read of r_size is now protected by r_statelock.
+		 */
+		mutex_enter(&np->r_statelock);
+		/*
+		 * When pgcreated is nonzero the caller has already done a
+		 * segmap_getmapflt with forcefault 0 and S_WRITE. With
+		 * segkpm this means we already have at least one page
+		 * created and mapped at base.
+		 */
+		pagecreate = pgcreated ||
+			((offset & PAGEOFFSET) == 0 &&
+			 (n == PAGESIZE || ((offset + n) >= np->r_size)));
+
+		mutex_exit(&np->r_statelock);
+
+		if (!vpm_enable && pagecreate) {
+			/*
+			 * The last argument tells segmap_pagecreate() to
+			 * always lock the page, as opposed to sometimes
+			 * returning with the page locked. This way we avoid
+			 * a fault on the ensuing uiomove(), but also more
+			 * importantly (to fix bug 1094402) we can call
+			 * segmap_fault() to unlock the page in all cases. An
+			 * alternative would be to modify segmap_pagecreate()
+			 * to tell us when it is locking a page, but that's a
+			 * fairly major interface change.
+			 */
+			if (pgcreated == 0)
+				(void) segmap_pagecreate(segkmap, base,
+							 (uint_t) n, 1);
+			saved_base = base;
+			saved_n = n;
+		}
+		/*
+		 * The number of bytes of data in the last page can not be
+		 * accurately be determined while page is being uiomove'd to
+		 * and the size of the file being updated. Thus, inform
+		 * threads which need to know accurately how much data is in
+		 * the last page of the file. They will not do the i/o
+		 * immediately, but will arrange for the i/o to happen later
+		 * when this modify operation will have finished.
+		 */
+		ASSERT(!(np->r_flags & RMODINPROGRESS));
+		mutex_enter(&np->r_statelock);
+		np->r_flags |= RMODINPROGRESS;
+		np->r_modaddr = (offset & MAXBMASK);
+		mutex_exit(&np->r_statelock);
+
+		if (vpm_enable) {
+			/*
+			 * Copy data. If new pages are created, part of the
+			 * page that is not written will be initizliazed with
+			 * zeros.
+			 */
+			error = vpm_data_copy(vp, offset, n, uiop,
+					      !pagecreate, NULL, 0, S_WRITE);
+		} else {
+			error = uiomove(base, n, UIO_WRITE, uiop);
+		}
+
+		/*
+		 * r_size is the maximum number of bytes known to be in the
+		 * file. Make sure it is at least as high as the first
+		 * unwritten byte pointed to by uio_loffset.
+		 */
+		mutex_enter(&np->r_statelock);
+		if (np->r_size < uiop->uio_loffset)
+			np->r_size = uiop->uio_loffset;
+		np->r_flags &= ~RMODINPROGRESS;
+		np->r_flags |= RDIRTY;
+		mutex_exit(&np->r_statelock);
+
+		/* n = # of bytes written */
+		n = (int) (uiop->uio_loffset - offset);
+
+		if (!vpm_enable) {
+			base += n;
+		}
+		tcount -= n;
+		/*
+		 * If we created pages w/o initializing them completely, we
+		 * need to zero the part that wasn't set up. This happens on
+		 * a most EOF write cases and if we had some sort of error
+		 * during the uiomove.
+		 */
+		if (!vpm_enable && pagecreate) {
+			if ((uiop->uio_loffset & PAGEOFFSET) || n == 0)
+				(void) kzero(base, PAGESIZE - n);
+
+			if (pgcreated) {
+				/*
+				 * Caller is responsible for this page, it
+				 * was not created in this loop.
+				 */
+				pgcreated = 0;
+			} else {
+				/*
+				 * For bug 1094402: segmap_pagecreate locks
+				 * page. Unlock it. This also unlocks the
+				 * pages allocated by page_create_va() in
+				 * segmap_pagecreate().
+				 */
+				sm_error = segmap_fault(kas.a_hat, segkmap,
+							saved_base, saved_n,
+						     F_SOFTUNLOCK, S_WRITE);
+				if (error == 0)
+					error = sm_error;
+			}
+		}
+	} while (tcount > 0 && error == 0);
+
+	return (error);
+}
 
 /* ARGSUSED */
 static int
@@ -2996,3 +3486,570 @@ smbfs_shrlock(vnode_t *vp, int cmd, struct shrlock *shr, int flag, cred_t *cr,
 		return (ENOSYS);
 }
 
+/* correspond to bp_mapin() in bp_map.c */
+static int 
+uio_page_mapin(uio_t * uiop, page_t * pp)
+{
+	u_offset_t      off;
+	size_t          size;
+	pgcnt_t         npages;
+	caddr_t         kaddr;
+	pfn_t           pfnum;
+
+	off = (uintptr_t) uiop->uio_loffset & PAGEOFFSET;
+	size = P2ROUNDUP(uiop->uio_resid + off, PAGESIZE);
+	npages = btop(size);
+
+	ASSERT(pp != NULL);
+
+	if (npages == 1 && kpm_enable) {
+		kaddr = hat_kpm_mapin(pp, NULL);
+		if (kaddr == NULL)
+			return (EFAULT);
+
+		uiop->uio_iov->iov_base = kaddr + off;
+		uiop->uio_iov->iov_len = PAGESIZE - off;
+
+	} else {
+		kaddr = vmem_xalloc(heap_arena, size, PAGESIZE, 0, 0, NULL, NULL, VM_SLEEP);
+		if (kaddr == NULL)
+			return (EFAULT);
+
+		uiop->uio_iov->iov_base = kaddr + off;
+		uiop->uio_iov->iov_len = size - off;
+
+		/* map pages into kaddr */
+		uint_t          attr = PROT_READ | PROT_WRITE | HAT_NOSYNC;
+		while (npages-- > 0) {
+			pfnum = pp->p_pagenum;
+			pp = pp->p_next;
+
+			hat_devload(kas.a_hat, kaddr, PAGESIZE, pfnum, attr, HAT_LOAD_LOCK);
+			kaddr += PAGESIZE;
+		}
+	}
+	return (0);
+}
+
+/* correspond to bp_mapout() in bp_map.c */
+static void 
+uio_page_mapout(uio_t * uiop, page_t * pp)
+{
+	u_offset_t      off;
+	size_t          size;
+	pgcnt_t         npages;
+	caddr_t         kaddr;
+
+	kaddr = uiop->uio_iov->iov_base;
+	off = (uintptr_t) kaddr & PAGEOFFSET;
+	size = P2ROUNDUP(uiop->uio_iov->iov_len + off, PAGESIZE);
+	npages = btop(size);
+
+	ASSERT(pp != NULL);
+
+	kaddr = (caddr_t) ((uintptr_t) kaddr & MMU_PAGEMASK);
+
+	if (npages == 1 && kpm_enable) {
+		hat_kpm_mapout(pp, NULL, kaddr);
+
+	} else {
+		hat_unload(kas.a_hat, (void *) kaddr, size,
+			   HAT_UNLOAD_NOSYNC | HAT_UNLOAD_UNLOCK);
+		vmem_free(heap_arena, (void *) kaddr, size);
+	}
+	uiop->uio_iov->iov_base = 0;
+	uiop->uio_iov->iov_len = 0;
+}
+
+static int 
+smbfs_map(vnode_t * vp, offset_t off, struct as * as, caddr_t * addrp,
+       size_t len, uchar_t prot, uchar_t maxprot, uint_t flags, cred_t * cr,
+	  caller_context_t * ct)
+{
+	smbnode_t      *np;
+	smbmntinfo_t   *smi;
+	struct vattr    va;
+	segvn_crargs_t  vn_a;
+	int             error;
+
+	np = VTOSMB(vp);
+	smi = VTOSMI(vp);
+
+	if (curproc->p_zone != smi->smi_zone_ref.zref_zone)
+		return (EIO);
+
+	if (smi->smi_flags & SMI_DEAD || vp->v_vfsp->vfs_flag & VFS_UNMOUNTED)
+		return (EIO);
+
+	if (vp->v_flag & VNOMAP || vp->v_flag & VNOCACHE)
+		return (EAGAIN);
+
+	if (vp->v_type != VREG)
+		return (ENODEV);
+
+	va.va_mask = AT_ALL;
+	if (error = smbfsgetattr(vp, &va, cr))
+		return (error);
+
+	if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_WRITER, SMBINTR(vp)))
+		return (EINTR);
+
+	if (MANDLOCK(vp, va.va_mode)) {
+		error = EAGAIN;
+		goto out;
+	}
+	as_rangelock(as);
+	error = choose_addr(as, addrp, len, off, ADDR_VACALIGN, flags);
+
+	if (error != 0) {
+		as_rangeunlock(as);
+		goto out;
+	}
+	vn_a.vp = vp;
+	vn_a.offset = off;
+	vn_a.type = flags & MAP_TYPE;
+	vn_a.prot = prot;
+	vn_a.maxprot = maxprot;
+	vn_a.flags = flags & ~MAP_TYPE;
+	vn_a.cred = cr;
+	vn_a.amp = NULL;
+	vn_a.szc = 0;
+	vn_a.lgrp_mem_policy_flags = 0;
+
+	error = as_map(as, *addrp, len, segvn_create, &vn_a);
+
+	as_rangeunlock(as);
+
+out:
+	smbfs_rw_exit(&np->r_lkserlock);
+
+	return (error);
+}
+
+static int 
+smbfs_addmap(vnode_t * vp, offset_t off, struct as * as, caddr_t addr,
+       size_t len, uchar_t prot, uchar_t maxprot, uint_t flags, cred_t * cr,
+	     caller_context_t * ct)
+{
+	atomic_add_long((ulong_t *) & VTOSMB(vp)->r_mapcnt, btopr(len));
+	return (0);
+}
+
+static int 
+smbfs_delmap(vnode_t * vp, offset_t off, struct as * as, caddr_t addr,
+	 size_t len, uint_t prot, uint_t maxprot, uint_t flags, cred_t * cr,
+	     caller_context_t * ct)
+{
+
+	smbnode_t      *np;
+
+	atomic_add_long((ulong_t *) & VTOSMB(vp)->r_mapcnt, -btopr(len));
+
+	/*
+	 * mark RDIRTY here, will be used to check if a file is dirty when
+	 * unmount smbfs
+	 */
+	if (vn_has_cached_data(vp) && !vn_is_readonly(vp) && (maxprot & PROT_WRITE)
+	    && (flags == MAP_SHARED)) {
+		np = VTOSMB(vp);
+		mutex_enter(&np->r_statelock);
+		np->r_flags |= RDIRTY;
+		mutex_exit(&np->r_statelock);
+	}
+	return (0);
+}
+
+static int 
+smbfs_putpage(vnode_t * vp, offset_t off, size_t len, int flags,
+	      cred_t * cr, caller_context_t * ct)
+{
+
+	smbnode_t      *np;
+	size_t          io_len;
+	u_offset_t      io_off;
+	u_offset_t      eoff;
+	int             error = 0;
+	page_t         *pp;
+	int             rdirty;
+
+	np = VTOSMB(vp);
+
+	if (len == 0) {
+
+		/* will flush the whole file, so clear RDIRTY */
+		if (off == (u_offset_t) 0 && (np->r_flags & RDIRTY)) {
+			mutex_enter(&np->r_statelock);
+			rdirty = np->r_flags & RDIRTY;
+			np->r_flags &= ~RDIRTY;
+			mutex_exit(&np->r_statelock);
+		} else
+			rdirty = 0;
+
+		error = pvn_vplist_dirty(vp, off, smbfs_putapage, flags, cr);
+
+		/*
+		 * if failed and the vnode was dirty before and we aren't
+		 * forcibly invalidating pages, then mark RDIRTY again.
+		 */
+		if (error && rdirty &&
+		    (flags & (B_INVAL | B_FORCE)) != (B_INVAL | B_FORCE)) {
+			mutex_enter(&np->r_statelock);
+			np->r_flags |= RDIRTY;
+			mutex_exit(&np->r_statelock);
+		}
+	} else {
+
+		eoff = off + len;
+
+		mutex_enter(&np->r_statelock);
+		if (eoff > np->r_size)
+			eoff = np->r_size;
+		mutex_exit(&np->r_statelock);
+
+		for (io_off = off; io_off < eoff; io_off += io_len) {
+			if ((flags & B_INVAL) || (flags & B_ASYNC) == 0) {
+				pp = page_lookup(vp, io_off,
+						 (flags & (B_INVAL | B_FREE) ? SE_EXCL : SE_SHARED));
+			} else {
+				pp = page_lookup_nowait(vp, io_off,
+				    (flags & B_FREE) ? SE_EXCL : SE_SHARED);
+			}
+
+			if (pp == NULL || !pvn_getdirty(pp, flags))
+				io_len = PAGESIZE;
+			else {
+				error = smbfs_putapage(vp, pp, &io_off, &io_len, flags, cr);
+			}
+		}
+
+	}
+
+	return (error);
+}
+
+static int 
+smbfs_putapage(vnode_t * vp, page_t * pp, u_offset_t * offp, size_t * lenp,
+	       int flags, cred_t * cr)
+{
+
+	struct smb_cred scred;
+	smbnode_t      *np;
+	smbmntinfo_t   *smi;
+	smb_share_t    *ssp;
+	uio_t           uio;
+	iovec_t         uiov, uiov_bak;
+
+	size_t          io_len;
+	u_offset_t      io_off;
+	size_t          bsize;
+	size_t          blksize;
+	u_offset_t      blkoff;
+	int             error;
+
+	np = VTOSMB(vp);
+	smi = VTOSMI(vp);
+	ssp = smi->smi_share;
+
+	/* do block io, get a kluster of dirty pages in a block. */
+	bsize = MAX(vp->v_vfsp->vfs_bsize, PAGESIZE);
+	blkoff = pp->p_offset / bsize;
+	blkoff *= bsize;
+	blksize = roundup(bsize, PAGESIZE);
+
+	pp = pvn_write_kluster(vp, pp, &io_off, &io_len, blkoff, blksize, flags);
+
+	ASSERT(pp->p_offset >= blkoff);
+
+	if (io_off + io_len > blkoff + blksize) {
+		ASSERT((io_off + io_len) - (blkoff + blksize) < PAGESIZE);
+		io_len = blkoff + blksize - io_off;
+	}
+	/*
+	 * Taken from NFS4. The RMODINPROGRESS flag makes sure that
+	 * smbfs_putapage() sees a consistent value of r_size. RMODINPROGRESS
+	 * is set in writenp(). When RMODINPROGRESS is set it indicates that
+	 * a uiomove() is in progress and the r_size has not been made
+	 * consistent with the new size of the file. When the uiomove()
+	 * completes the r_size is updated and the RMODINPROGRESS flag is
+	 * cleared.
+	 * 
+	 * The RMODINPROGRESS flag makes sure that smbfs_putapage() sees a
+	 * consistent value of r_size. Without this handshaking, it is
+	 * possible that smbfs_putapage() picks  up the old value of r_size
+	 * before the uiomove() in writenp() completes. This will result in
+	 * the write through smbfs_putapage() being dropped.
+	 * 
+	 * More precisely, there is a window between the time the uiomove()
+	 * completes and the time the r_size is updated. If a VOP_PUTPAGE()
+	 * operation intervenes in this window, the page will be picked up,
+	 * because it is dirty (it will be unlocked, unless it was
+	 * pagecreate'd). When the page is picked up as dirty, the dirty bit
+	 * is reset (pvn_getdirty()). In smbfs_putapage(), r_size is checked.
+	 * This will still be the old size. Therefore the page will not be
+	 * written out. When segmap_release() calls VOP_PUTPAGE(), the page
+	 * will be found to be clean and the write will be dropped.
+	 */
+	if (np->r_flags & RMODINPROGRESS) {
+
+		mutex_enter(&np->r_statelock);
+		if ((np->r_flags & RMODINPROGRESS) &&
+		    np->r_modaddr + MAXBSIZE > io_off &&
+		    np->r_modaddr < io_off + io_len) {
+			page_t         *plist;
+			/*
+			 * A write is in progress for this region of the
+			 * file. If we did not detect RMODINPROGRESS here,
+			 * the data beyond the file size won't be write out.
+			 * We end up losing data. So we decide to set the
+			 * modified bit on each page in the page list and
+			 * mark the smbnode with RDIRTY. This write will be
+			 * restarted at some later time.
+			 */
+			plist = pp;
+			while (plist != NULL) {
+				pp = plist;
+				page_sub(&plist, pp);
+				hat_setmod(pp);
+				page_io_unlock(pp);
+				page_unlock(pp);
+			}
+			np->r_flags |= RDIRTY;
+			mutex_exit(&np->r_statelock);
+			if (offp)
+				*offp = io_off;
+			if (lenp)
+				*lenp = io_len;
+			return (0);
+		}
+		mutex_exit(&np->r_statelock);
+	}
+	/* Don't allow put pages beyond EOF */
+	mutex_enter(&np->r_statelock);
+	if (io_off >= np->r_size) {
+		mutex_exit(&np->r_statelock);
+		error = 0;
+		goto out;
+	} else if (io_off + io_len > np->r_size) {
+		int             npages = btopr(np->r_size - io_off);
+		page_t         *trunc;
+		page_list_break(&pp, &trunc, npages);
+		if (trunc)
+			pvn_write_done(trunc, flags);
+		io_len = np->r_size - io_off;
+	}
+	mutex_exit(&np->r_statelock);
+
+	if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_READER, SMBINTR(vp)))
+		return (EINTR);
+	smb_credinit(&scred, cr);
+
+	if (np->n_vcgenid != ssp->ss_vcgenid)
+		error = ESTALE;
+	else {
+		/* just use uio instead of buf, since smb_rwuio need uio. */
+		uiov.iov_base = 0;
+		uiov.iov_len = 0;
+		uio.uio_iov = &uiov;
+		uio.uio_iovcnt = 1;
+		uio.uio_loffset = io_off;
+		uio.uio_resid = io_len;
+		uio.uio_segflg = UIO_SYSSPACE;
+		uio.uio_llimit = MAXOFFSET_T;
+		/* map pages into kernel address space, and setup uio. */
+		error = uio_page_mapin(&uio, pp);
+		if (error == 0) {
+			uiov_bak.iov_base = uiov.iov_base;
+			uiov_bak.iov_len = uiov.iov_len;
+			error = smb_rwuio(ssp, np->n_fid, UIO_WRITE, &uio, &scred, smb_timo_write);
+			if (error == 0) {
+				mutex_enter(&np->r_statelock);
+				np->n_flag |= (NFLUSHWIRE | NATTRCHANGED);
+				mutex_exit(&np->r_statelock);
+				(void) smbfs_smb_flush(np, &scred);
+			}
+			/* unmap pages from kernel address space. */
+			uio.uio_iov = &uiov_bak;
+			uio_page_mapout(&uio, pp);
+		}
+	}
+
+	smb_credrele(&scred);
+	smbfs_rw_exit(&np->r_lkserlock);
+
+out:
+	pvn_write_done(pp, ((error) ? B_ERROR : 0) | B_WRITE | flags);
+
+	if (offp)
+		*offp = io_off;
+	if (lenp)
+		*lenp = io_len;
+
+	return (error);
+}
+
+static int 
+smbfs_getpage(vnode_t * vp, offset_t off, size_t len, uint_t * protp,
+	      page_t * pl[], size_t plsz, struct seg * seg, caddr_t addr,
+	      enum seg_rw rw, cred_t * cr, caller_context_t * ct)
+{
+
+	int             error;
+
+	/* these pages have all protections. */
+	if (protp)
+		*protp = PROT_ALL;
+
+	if (len <= PAGESIZE) {
+		error = smbfs_getapage(vp, off, len, protp, pl, plsz, seg, addr, rw,
+				       cr);
+	} else {
+		error = pvn_getpages(smbfs_getapage, vp, off, len, protp, pl, plsz, seg,
+				     addr, rw, cr);
+	}
+
+	return (error);
+}
+
+static int 
+smbfs_getapage(vnode_t * vp, u_offset_t off, size_t len,
+ uint_t * protp, page_t * pl[], size_t plsz, struct seg * seg, caddr_t addr,
+	       enum seg_rw rw, cred_t * cr)
+{
+
+	smbnode_t      *np;
+	smbmntinfo_t   *smi;
+	smb_share_t    *ssp;
+	smb_cred_t      scred;
+
+	page_t         *pp;
+	uio_t           uio;
+	iovec_t         uiov, uiov_bak;
+
+	u_offset_t      blkoff;
+	size_t          bsize;
+	size_t          blksize;
+
+	u_offset_t      io_off;
+	size_t          io_len;
+	size_t          pages_len;
+
+	int             error = 0;
+
+	np = VTOSMB(vp);
+	smi = VTOSMI(vp);
+	ssp = smi->smi_share;
+
+	/* if pl is null,it's meaningless */
+	if (pl == NULL)
+		return (EFAULT);
+
+again:
+	if (page_exists(vp, off) == NULL) {
+		if (rw == S_CREATE) {
+			/* just return a empty page if asked to create. */
+			if ((pp = page_create_va(vp, off, PAGESIZE, PG_WAIT | PG_EXCL, seg, addr)) == NULL)
+				goto again;
+			pages_len = PAGESIZE;
+		} else {
+
+			/*
+			 * do block io, get a kluster of non-exist pages in a
+			 * block.
+			 */
+			bsize = MAX(vp->v_vfsp->vfs_bsize, PAGESIZE);
+			blkoff = off / bsize;
+			blkoff *= bsize;
+			blksize = roundup(bsize, PAGESIZE);
+
+			pp = pvn_read_kluster(vp, off, seg, addr, &io_off, &io_len, blkoff, blksize, 0);
+
+			if (pp == NULL)
+				goto again;
+
+			pages_len = io_len;
+
+			/* Don't allow get pages beyond EOF. */
+			mutex_enter(&np->r_statelock);
+			if (io_off >= np->r_size) {
+				mutex_exit(&np->r_statelock);
+				error = 0;
+				goto out;
+			} else if (io_off + io_len > np->r_size) {
+				int             npages = btopr(np->r_size - io_off);
+				page_t         *trunc;
+
+				page_list_break(&pp, &trunc, npages);
+				if (trunc)
+					pvn_read_done(trunc, 0);
+				io_len = np->r_size - io_off;
+			}
+			mutex_exit(&np->r_statelock);
+
+			if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_READER, SMBINTR(vp)))
+				return EINTR;
+			smb_credinit(&scred, cr);
+
+			/*
+			 * just use uio instead of buf, since smb_rwuio need
+			 * uio.
+			 */
+			uiov.iov_base = 0;
+			uiov.iov_len = 0;
+			uio.uio_iov = &uiov;
+			uio.uio_iovcnt = 1;
+			uio.uio_loffset = io_off;
+			uio.uio_resid = io_len;
+			uio.uio_segflg = UIO_SYSSPACE;
+			uio.uio_llimit = MAXOFFSET_T;
+
+			/*
+			 * map pages into kernel address space, and setup
+			 * uio.
+			 */
+			error = uio_page_mapin(&uio, pp);
+			if (error == 0) {
+				uiov_bak.iov_base = uiov.iov_base;
+				uiov_bak.iov_len = uiov.iov_len;
+				error = smb_rwuio(ssp, np->n_fid, UIO_READ, &uio, &scred, smb_timo_read);
+				/* unmap pages from kernel address space. */
+				uio.uio_iov = &uiov_bak;
+				uio_page_mapout(&uio, pp);
+			}
+			smb_credrele(&scred);
+			smbfs_rw_exit(&np->r_lkserlock);
+		}
+	} else {
+		se_t            se = rw == S_CREATE ? SE_EXCL : SE_SHARED;
+		if ((pp = page_lookup(vp, off, se)) == NULL) {
+			goto again;
+		}
+	}
+
+out:
+	if (pp) {
+		if (error) {
+			pvn_read_done(pp, B_ERROR);
+		} else {
+			/* init page list, unlock pages. */
+			pvn_plist_init(pp, pl, plsz, off, pages_len, rw);
+		}
+	}
+	return (error);
+}
+
+/* correspond to nfs_invalidate_pages() in nfs_client.c */
+void 
+smbfs_invalidate_pages(vnode_t * vp, u_offset_t off, cred_t * cr)
+{
+
+	smbnode_t      *np;
+
+	np = VTOSMB(vp);
+	/* will flush the whole file, so clear RDIRTY */
+	if (off == (u_offset_t) 0 && (np->r_flags & RDIRTY)) {
+		mutex_enter(&np->r_statelock);
+		np->r_flags &= ~RDIRTY;
+		mutex_exit(&np->r_statelock);
+	}
+	(void) pvn_vplist_dirty(vp, off, smbfs_putapage, B_INVAL | B_TRUNC, cr);
+}

@@ -124,7 +124,6 @@ smbfs_validate_caches(
 void
 smbfs_purge_caches(struct vnode *vp)
 {
-#if 0	/* not yet: mmap support */
 	/*
 	 * NFS: Purge the DNLC for this vp,
 	 * Clear any readdir state bits,
@@ -136,9 +135,8 @@ smbfs_purge_caches(struct vnode *vp)
 	 * Flush the page cache.
 	 */
 	if (vn_has_cached_data(vp)) {
-		(void) VOP_PUTPAGE(vp, (u_offset_t)0, 0, B_INVAL, cr, NULL);
+		(void) VOP_PUTPAGE(vp, (u_offset_t) 0, 0, B_INVAL, np->r_cred, NULL);
 	}
-#endif	/* not yet */
 }
 
 /*
@@ -294,12 +292,11 @@ smbfs_attrcache_fa(vnode_t *vp, struct smbfattr *fap)
 		newsize = DEV_BSIZE;
 
 	if (np->r_size != newsize) {
-#if 0	/* not yet: mmap support */
-		if (!vn_has_cached_data(vp) || ...)
-			/* XXX: See NFS page cache code. */
-#endif	/* not yet */
-		/* OK to set the size. */
-		np->r_size = newsize;
+		if (!vn_has_cached_data(vp) 
+		    || (!(np->r_flags & RDIRTY)&& np->r_count == 0)) {
+			/* OK to set the size. */
+			np->r_size = newsize;
+		}
 	}
 
 	/* NFS: np->r_flags &= ~RWRITEATTR; */

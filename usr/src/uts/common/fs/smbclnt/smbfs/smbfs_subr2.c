@@ -160,7 +160,7 @@ sn_inactive(smbnode_t *np)
 	vnode_t		*vp;
 
 	/*
-	 * Flush and invalidate all pages (todo)
+	 * Flush and invalidate all pages
 	 * Free any held credentials and caches...
 	 * etc.  (See NFS code)
 	 */
@@ -1041,8 +1041,9 @@ sn_destroy_node(smbnode_t *np)
 }
 
 /*
+ * Correspond to nfs_rflush().
  * Flush all vnodes in this (or every) vfs.
- * Used by nfs_sync and by nfs_unmount.
+ * Used by smbfs_sync and by smbfs_unmount.
  */
 /*ARGSUSED*/
 void
