@@ -945,7 +945,7 @@ smbfs_write(vnode_t * vp, struct uio * uiop, int ioflag, cred_t * cr,
 
 			if (!error) {
 				if (uiop->uio_loffset % bsize == 0) {
-					flags = SM_WRITE | SM_ASYNC | SM_DONTNEED;
+					flags = SM_WRITE | SM_DONTNEED;
 				} else {
 					flags = 0;
 				}
@@ -3741,6 +3741,7 @@ smbfs_putapage(vnode_t * vp, page_t * pp, u_offset_t * offp, size_t * lenp,
 
 	size_t          io_len;
 	u_offset_t      io_off;
+	size_t          limit;
 	size_t          bsize;
 	size_t          blksize;
 	u_offset_t      blkoff;
@@ -3762,8 +3763,25 @@ smbfs_putapage(vnode_t * vp, page_t * pp, u_offset_t * offp, size_t * lenp,
 
 	if (io_off + io_len > blkoff + blksize) {
 		ASSERT((io_off + io_len) - (blkoff + blksize) < PAGESIZE);
-		io_len = blkoff + blksize - io_off;
 	}
+
+	/* Don't allow put pages beyond EOF */
+	mutex_enter(&np->r_statelock);
+	limit=MIN(np->r_size, blkoff + blksize);
+	mutex_exit(&np->r_statelock);
+
+	if (io_off >= limit) {
+		error = 0;
+		goto out;
+	} else if (io_off + io_len > limit) {
+		int             npages = btopr(limit - io_off);
+		page_t         *trunc;
+		page_list_break(&pp, &trunc, npages);
+		if (trunc)
+			pvn_write_done(trunc, flags);
+		io_len = limit - io_off;
+	}
+
 	/*
 	 * Taken from NFS4. The RMODINPROGRESS flag makes sure that
 	 * smbfs_putapage() sees a consistent value of r_size. RMODINPROGRESS
@@ -3823,21 +3841,6 @@ smbfs_putapage(vnode_t * vp, page_t * pp, u_offset_t * offp, size_t * lenp,
 		}
 		mutex_exit(&np->r_statelock);
 	}
-	/* Don't allow put pages beyond EOF */
-	mutex_enter(&np->r_statelock);
-	if (io_off >= np->r_size) {
-		mutex_exit(&np->r_statelock);
-		error = 0;
-		goto out;
-	} else if (io_off + io_len > np->r_size) {
-		int             npages = btopr(np->r_size - io_off);
-		page_t         *trunc;
-		page_list_break(&pp, &trunc, npages);
-		if (trunc)
-			pvn_write_done(trunc, flags);
-		io_len = np->r_size - io_off;
-	}
-	mutex_exit(&np->r_statelock);
 
 	if (smbfs_rw_enter_sig(&np->r_lkserlock, RW_READER, SMBINTR(vp)))
 		return (EINTR);
@@ -3893,11 +3896,22 @@ smbfs_getpage(vnode_t * vp, offset_t off, size_t len, uint_t * protp,
 	      enum seg_rw rw, cred_t * cr, caller_context_t * ct)
 {
 
+	smbnode_t      *np;
 	int             error;
 
 	/* these pages have all protections. */
 	if (protp)
 		*protp = PROT_ALL;
+
+	np = VTOSMB(vp);
+
+	/* Don't allow get pages beyond EOF, unless it's segkmap. */
+	mutex_enter(&np->r_statelock);
+	if (off + len > np->r_size + PAGESIZE && seg != segkmap){
+		mutex_exit(&np->r_statelock);
+		return (EFAULT);
+	}
+	mutex_exit(&np->r_statelock);
 
 	if (len <= PAGESIZE) {
 		error = smbfs_getapage(vp, off, len, protp, pl, plsz, seg, addr, rw,
@@ -3968,9 +3982,10 @@ again:
 
 			pages_len = io_len;
 
-			/* Don't allow get pages beyond EOF. */
+			/* Don't need to get pages from server if it's segkmap 
+			 * that reads beyond EOF. */
 			mutex_enter(&np->r_statelock);
-			if (io_off >= np->r_size) {
+			if (io_off >= np->r_size && seg == segkmap) {
 				mutex_exit(&np->r_statelock);
 				error = 0;
 				goto out;

@@ -1041,7 +1041,7 @@ sn_destroy_node(smbnode_t *np)
 }
 
 /*
- * Correspond to nfs_rflush().
+ * Correspond to rflush() in NFS.
  * Flush all vnodes in this (or every) vfs.
  * Used by smbfs_sync and by smbfs_unmount.
  */
@@ -1057,10 +1057,15 @@ smbfs_rflush(struct vfs *vfsp, cred_t *cr) {
 
     vnode_t **vplist;
 
+    if(vfsp == NULL)
+        return;
+
     mi = VFTOSMI(vfsp);
 
     cnt = 0;
+
     num = mi->smi_hash_avl.avl_numnodes;
+
     vplist = kmem_alloc(num * sizeof (vnode_t*), KM_SLEEP);
 
     rw_enter(&mi->smi_hash_lk, RW_READER);
